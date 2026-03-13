@@ -59,9 +59,12 @@ class ProtossBot(BotAI):
     def __init__(self):
         super().__init__()
         self.attack_committed = False
+        self.opening_pressure_committed = False
         self.enemy_start_candidates: list[Point2] = []
         self.confirmed_enemy_start: Point2 | None = None
         self.scout_worker_tag: int | None = None
+        self.cannon_rush_committed = False
+        self.cannon_rush_abandoned = False
 
     @property
     def army(self):
@@ -199,6 +202,124 @@ class ProtossBot(BotAI):
             lambda unit: unit.can_be_attacked and unit.is_flying
         )
 
+    def scout_worker(self):
+        if self.scout_worker_tag is None:
+            return None
+        return self.workers.find_by_tag(self.scout_worker_tag)
+
+    def cannon_rush_anchor(self) -> Point2 | None:
+        if self.confirmed_enemy_start is None:
+            return None
+        return self.confirmed_enemy_start.towards(self.game_info.map_center, 7)
+
+    def forward_cannon_pylons(self):
+        if self.confirmed_enemy_start is None:
+            return self.structures(UnitTypeId.PYLON).filter(lambda _: False)
+        return self.structures(UnitTypeId.PYLON).filter(
+            lambda pylon: pylon.distance_to(self.confirmed_enemy_start) < 18
+        )
+
+    def forward_cannons(self):
+        if self.confirmed_enemy_start is None:
+            return self.structures(UnitTypeId.PHOTONCANNON).filter(lambda _: False)
+        return self.structures(UnitTypeId.PHOTONCANNON).filter(
+            lambda cannon: cannon.distance_to(self.confirmed_enemy_start) < 18
+        )
+
+    def local_defensive_pressure(self, nexus):
+        enemy_units = self.enemy_units.closer_than(24, nexus).filter(
+            lambda unit: unit.can_be_attacked
+            and unit.type_id not in WORKER_TYPES
+            and (unit.can_attack_ground or unit.can_attack_air or unit.is_flying)
+        )
+        proxy_structures = self.enemy_structures.closer_than(20, nexus).filter(
+            lambda structure: structure.can_be_attacked and not structure.is_flying
+        )
+
+        pressure = enemy_units.amount + (proxy_structures.amount * 2)
+        if enemy_units.filter(lambda unit: unit.can_attack_ground).amount >= 3:
+            pressure += 2
+        if self.time < 300 and enemy_units.amount >= 2:
+            pressure += 1
+        return enemy_units, proxy_structures, pressure
+
+    def is_under_early_rush(self) -> bool:
+        if not self.townhalls.ready.exists:
+            return False
+
+        for nexus in self.townhalls.ready:
+            enemy_units, proxy_structures, pressure = self.local_defensive_pressure(nexus)
+            if proxy_structures.exists:
+                return True
+            if self.time < 330 and pressure >= 3:
+                return True
+            if enemy_units.amount >= 5:
+                return True
+        return False
+
+    def should_prepare_cannon_rush(self) -> bool:
+        if self.cannon_rush_abandoned:
+            return False
+        if self.time > 180:
+            return False
+        if self.confirmed_enemy_start is None:
+            return False
+        if self.townhalls.amount + self.already_pending(UnitTypeId.NEXUS) > 1:
+            return False
+        if self.workers.amount < 16:
+            return False
+        if self.is_under_early_rush():
+            return False
+        scout = self.scout_worker()
+        if scout is None:
+            return False
+        if scout.shield_health_percentage < 0.35:
+            return False
+        return True
+
+    def is_cannon_rush_active(self) -> bool:
+        if self.cannon_rush_abandoned:
+            return False
+        if not self.cannon_rush_committed:
+            return False
+        if self.time > 260:
+            return False
+        if self.forward_cannon_pylons().exists or self.forward_cannons().exists:
+            return True
+        return (
+            self.structures(UnitTypeId.FORGE).exists
+            or self.already_pending(UnitTypeId.FORGE) > 0
+        )
+
+    def should_opening_pressure(self) -> bool:
+        if self.attack_committed:
+            return False
+        if self.is_under_early_rush():
+            return False
+        if self.should_prepare_cannon_rush() or self.is_cannon_rush_active():
+            return False
+        if self.confirmed_enemy_start is None or not self.townhalls.ready.exists:
+            return False
+        if self.time < 150 or self.time > 360:
+            return False
+        if self.townhalls.ready.amount > 2:
+            return False
+        if self.gateway_total() < 2:
+            return False
+        if self.army_strength() >= 8:
+            return True
+        return (
+            self.units(UnitTypeId.STALKER).amount >= 3
+            and self.units(UnitTypeId.ZEALOT).amount >= 2
+        )
+
+    def opening_pressure_point(self) -> Point2:
+        if self.enemy_structures.exists:
+            return self.enemy_structures.closest_to(self.start_location).position
+        if self.confirmed_enemy_start is not None:
+            return self.confirmed_enemy_start.towards(self.game_info.map_center, 4)
+        return self.enemy_reference_point()
+
     def should_attack(self) -> bool:
         blink_ready = self.already_pending_upgrade(UpgradeId.BLINKTECH) == 1
         if self.supply_used >= 170:
@@ -213,6 +334,26 @@ class ProtossBot(BotAI):
         stalkers = self.units(UnitTypeId.STALKER).amount
         zealots = self.units(UnitTypeId.ZEALOT).amount
         sentries = self.units(UnitTypeId.SENTRY).amount
+        rush_pressure = self.is_under_early_rush()
+        opening_pressure = self.should_opening_pressure()
+
+        if rush_pressure:
+            if not self.structures(UnitTypeId.CYBERNETICSCORE).ready.exists:
+                return UnitTypeId.ZEALOT
+            if self.enemy_air_threats().closer_than(20, self.townhalls.ready.center).exists:
+                return UnitTypeId.STALKER
+            if stalkers < 4:
+                return UnitTypeId.STALKER
+            if zealots < 2:
+                return UnitTypeId.ZEALOT
+
+        if opening_pressure:
+            if not self.structures(UnitTypeId.CYBERNETICSCORE).ready.exists:
+                return UnitTypeId.ZEALOT
+            if zealots < 2:
+                return UnitTypeId.ZEALOT
+            if stalkers < 4:
+                return UnitTypeId.STALKER
 
         if (
             self.structures(UnitTypeId.CYBERNETICSCORE).ready.exists
@@ -293,6 +434,7 @@ class ProtossBot(BotAI):
         await self.expand()
         await self.build_assimilators()
         await self.build_tech()
+        await self.execute_cannon_rush()
         await self.build_static_defense()
         await self.research_upgrades()
         await self.morph_warpgates()
@@ -343,11 +485,14 @@ class ProtossBot(BotAI):
 
     async def expand(self):
         total_bases = self.townhalls.ready.amount + self.already_pending(UnitTypeId.NEXUS)
+        cannon_rush_active = self.should_prepare_cannon_rush() or self.is_cannon_rush_active()
 
         if (
             total_bases < 2
             and self.workers.amount >= 20
             and self.structures(UnitTypeId.GATEWAY).ready.exists
+            and not cannon_rush_active
+            and not self.is_under_early_rush()
             and self.can_afford(UnitTypeId.NEXUS)
         ):
             await self.expand_now()
@@ -357,6 +502,8 @@ class ProtossBot(BotAI):
             total_bases < 3
             and self.workers.amount >= 44
             and self.army_strength() >= 10
+            and not cannon_rush_active
+            and not self.is_under_early_rush()
             and self.can_afford(UnitTypeId.NEXUS)
         ):
             await self.expand_now()
@@ -403,9 +550,22 @@ class ProtossBot(BotAI):
 
         pylon = self.structures(UnitTypeId.PYLON).ready.closest_to(self.game_info.map_center)
         total_gateways = self.gateway_total()
+        rush_pressure = self.is_under_early_rush()
 
         if total_gateways < 1 and self.can_afford(UnitTypeId.GATEWAY):
             await self.build(UnitTypeId.GATEWAY, near=pylon, max_distance=8)
+            return
+
+        if (
+            (rush_pressure or self.should_prepare_cannon_rush())
+            and self.structures(UnitTypeId.GATEWAY).ready.exists
+            and not self.structures(UnitTypeId.FORGE).exists
+            and not self.already_pending(UnitTypeId.FORGE)
+            and self.can_afford(UnitTypeId.FORGE)
+        ):
+            if await self.build(UnitTypeId.FORGE, near=pylon, max_distance=8):
+                if self.should_prepare_cannon_rush():
+                    self.cannon_rush_committed = True
             return
 
         if (
@@ -471,14 +631,25 @@ class ProtossBot(BotAI):
             await self.build(UnitTypeId.ROBOTICSBAY, near=pylon, max_distance=10)
 
     async def build_static_defense(self):
-        if not self.structures(UnitTypeId.CYBERNETICSCORE).ready.exists:
-            return
-        if not self.townhalls.ready.exists or not self.structures(UnitTypeId.PYLON).ready.exists:
+        if not self.townhalls.ready.exists:
             return
 
+        rush_pressure = self.is_under_early_rush()
+        cyber_ready = self.structures(UnitTypeId.CYBERNETICSCORE).ready.exists
+        forge_ready = self.structures(UnitTypeId.FORGE).ready.exists
         main = self.main_base()
+
         for nexus in self.townhalls.ready:
-            if main and nexus.tag == main.tag:
+            enemy_units, proxy_structures, pressure = self.local_defensive_pressure(nexus)
+            air_threats = self.enemy_air_threats().closer_than(20, nexus)
+
+            needs_static = (
+                rush_pressure
+                or air_threats.exists
+                or proxy_structures.exists
+                or (main is not None and nexus.tag != main.tag)
+            )
+            if not needs_static:
                 continue
 
             local_pylons = self.structures(UnitTypeId.PYLON).ready.closer_than(12, nexus)
@@ -494,13 +665,44 @@ class ProtossBot(BotAI):
                     )
                 return
 
+            desired_batteries = 1 if (main is not None and nexus.tag != main.tag) else 0
+            desired_cannons = 1 if (main is not None and nexus.tag != main.tag and forge_ready) else 0
+
+            if rush_pressure or proxy_structures.exists or air_threats.exists:
+                if main is not None and nexus.tag == main.tag:
+                    desired_batteries = max(desired_batteries, 1)
+                if forge_ready:
+                    desired_cannons = max(desired_cannons, 1)
+
+            if pressure >= 6 or air_threats.amount >= 2:
+                desired_batteries = max(desired_batteries, 2)
+                if forge_ready:
+                    desired_cannons = max(desired_cannons, 2)
+
             if (
-                self.structures(UnitTypeId.SHIELDBATTERY).closer_than(10, nexus).amount < 1
+                cyber_ready
+                and desired_batteries > 0
+                and
+                self.structures(UnitTypeId.SHIELDBATTERY).closer_than(10, nexus).amount < desired_batteries
                 and self.already_pending(UnitTypeId.SHIELDBATTERY) == 0
                 and self.can_afford(UnitTypeId.SHIELDBATTERY)
             ):
                 await self.build(
                     UnitTypeId.SHIELDBATTERY,
+                    near=local_pylons.closest_to(nexus),
+                    max_distance=6,
+                )
+                return
+
+            if (
+                forge_ready
+                and desired_cannons > 0
+                and self.structures(UnitTypeId.PHOTONCANNON).closer_than(10, nexus).amount < desired_cannons
+                and self.already_pending(UnitTypeId.PHOTONCANNON) == 0
+                and self.can_afford(UnitTypeId.PHOTONCANNON)
+            ):
+                await self.build(
+                    UnitTypeId.PHOTONCANNON,
                     near=local_pylons.closest_to(nexus),
                     max_distance=6,
                 )
@@ -699,6 +901,74 @@ class ProtossBot(BotAI):
         position = base_center.towards(enemy_focus, distance)
         await self.build(UnitTypeId.PYLON, near=position, max_distance=6, placement_step=2)
 
+    async def execute_cannon_rush(self):
+        if not (self.should_prepare_cannon_rush() or self.is_cannon_rush_active()):
+            return
+
+        scout = self.scout_worker()
+        anchor = self.cannon_rush_anchor()
+        if scout is None or anchor is None:
+            self.cannon_rush_abandoned = True
+            return
+
+        local_threats = self.enemy_units.closer_than(8, scout).filter(
+            lambda unit: unit.can_attack_ground and unit.type_id not in WORKER_TYPES
+        )
+        if local_threats.amount >= 2 and scout.shield_health_percentage < 0.5:
+            self.cannon_rush_abandoned = True
+            scout.move(self.start_location)
+            return
+
+        forward_pylons = self.forward_cannon_pylons()
+        forward_cannons = self.forward_cannons()
+
+        if not forward_pylons.exists:
+            if scout.distance_to(anchor) > 5:
+                scout.move(anchor)
+                return
+
+            if self.already_pending(UnitTypeId.PYLON) == 0 and self.can_afford(UnitTypeId.PYLON):
+                if await self.build(
+                    UnitTypeId.PYLON,
+                    near=anchor,
+                    max_distance=6,
+                    build_worker=scout,
+                    placement_step=1,
+                ):
+                    self.cannon_rush_committed = True
+            return
+
+        if not self.structures(UnitTypeId.FORGE).ready.exists:
+            scout.move(forward_pylons.closest_to(anchor))
+            return
+
+        desired_cannons = 1
+        if self.time < 180 and scout.shield_health_percentage > 0.6:
+            desired_cannons = 2
+
+        if (
+            forward_cannons.amount < desired_cannons
+            and self.already_pending(UnitTypeId.PHOTONCANNON) == 0
+            and self.can_afford(UnitTypeId.PHOTONCANNON)
+        ):
+            cannon_anchor = forward_pylons.closest_to(anchor).position.towards(
+                self.confirmed_enemy_start, 2
+            )
+            if await self.build(
+                UnitTypeId.PHOTONCANNON,
+                near=cannon_anchor,
+                max_distance=6,
+                build_worker=scout,
+                placement_step=1,
+            ):
+                self.cannon_rush_committed = True
+            return
+
+        if scout.is_idle:
+            scout.move(forward_pylons.closest_to(anchor))
+        if self.time > 220 and not forward_cannons.exists:
+            self.cannon_rush_abandoned = True
+
     async def warp_in_units(self):
         warpgates = self.structures(UnitTypeId.WARPGATE).ready
         if not warpgates.exists:
@@ -740,18 +1010,14 @@ class ProtossBot(BotAI):
                 break
 
     async def scout_with_probe(self):
-        if self.confirmed_enemy_start is not None:
-            return
         if self.time < 45 or self.workers.amount < 16:
             return
-        if self.units(UnitTypeId.OBSERVER).ready.exists:
+        if self.units(UnitTypeId.OBSERVER).ready.exists and not self.is_cannon_rush_active():
             return
 
-        scout = None
-        if self.scout_worker_tag is not None:
-            scout = self.workers.find_by_tag(self.scout_worker_tag)
-            if scout is None:
-                self.scout_worker_tag = None
+        scout = self.scout_worker()
+        if self.scout_worker_tag is not None and scout is None:
+            self.scout_worker_tag = None
 
         if scout is None:
             worker_pool = self.workers.gathering if self.workers.gathering.exists else self.workers
@@ -766,6 +1032,14 @@ class ProtossBot(BotAI):
         if hostile_threats.exists and scout.shield_health_percentage < 0.45:
             scout.move(self.start_location)
             self.scout_worker_tag = None
+            self.cannon_rush_abandoned = True
+            return
+
+        if self.confirmed_enemy_start is not None:
+            if self.should_prepare_cannon_rush() or self.is_cannon_rush_active():
+                anchor = self.cannon_rush_anchor()
+                if anchor is not None and (scout.is_idle or scout.distance_to(anchor) > 6):
+                    scout.move(anchor)
             return
 
         scout_target = self.next_scout_point()
@@ -784,7 +1058,7 @@ class ProtossBot(BotAI):
                 continue
             if self.army.exists and targets.exists:
                 observer.move(self.army.center.towards(targets.closest_to(self.army.center), 6))
-            elif self.attack_committed:
+            elif self.attack_committed or self.opening_pressure_committed:
                 observer.move(self.enemy_reference_point().towards(self.game_info.map_center, 8))
             else:
                 observer.move(self.game_info.map_center)
@@ -838,16 +1112,39 @@ class ProtossBot(BotAI):
 
         if defense_targets.exists:
             self.attack_committed = False
+            self.opening_pressure_committed = False
             destination = defense_targets.closest_to(self.townhalls.ready.center)
         else:
+            if (
+                not self.attack_committed
+                and not self.opening_pressure_committed
+                and self.should_opening_pressure()
+            ):
+                self.opening_pressure_committed = True
+
+            if (
+                self.opening_pressure_committed
+                and (
+                    self.is_under_early_rush()
+                    or self.time > 420
+                    or self.army_strength() < 6
+                )
+            ):
+                self.opening_pressure_committed = False
+
             if not self.attack_committed and self.should_attack():
                 self.attack_committed = True
             if self.attack_committed and self.army_strength() < 10:
                 self.attack_committed = False
 
             if self.attack_committed:
+                self.opening_pressure_committed = False
                 destination = (
                     targets.closest_to(army.center) if targets.exists else self.enemy_reference_point()
+                )
+            elif self.opening_pressure_committed:
+                destination = (
+                    targets.closest_to(army.center) if targets.exists else self.opening_pressure_point()
                 )
             else:
                 destination = self.gather_point()

@@ -7,6 +7,9 @@ import uuid
 from pathlib import Path
 
 from sc2.bot_ai import BotAI
+from sc2.client import Client
+from sc2.ids.unit_typeid import UnitTypeId
+from sc2.unit import Unit
 
 PREFERRED_CLASS_NAMES = (
     "CompetitiveBot",
@@ -15,11 +18,34 @@ PREFERRED_CLASS_NAMES = (
     "ZergBot",
 )
 
+WORKER_TYPES = {
+    UnitTypeId.SCV,
+    UnitTypeId.DRONE,
+    UnitTypeId.PROBE,
+    UnitTypeId.MULE,
+}
+
+
+def install_burnysc2_compat_shims() -> None:
+    # Older community bots sometimes call the pre-rename debug flush helper.
+    if not hasattr(Client, "send_debug") and hasattr(Client, "_send_debug"):
+        Client.send_debug = Client._send_debug
+
+    # Some older sample bots expect this legacy configuration attribute.
+    if not hasattr(BotAI, "starting_workers"):
+        BotAI.starting_workers = 12
+
+    # Older bots may use semantic flags that were removed from Unit.
+    if not hasattr(Unit, "is_worker"):
+        Unit.is_worker = property(lambda self: self.type_id in WORKER_TYPES)
+
 
 def load_bot_module(bot_file: str | Path):
     path = Path(bot_file).resolve()
     if not path.is_file():
         raise FileNotFoundError(f"Bot file not found: {path}")
+
+    install_burnysc2_compat_shims()
 
     module_name = f"uploaded_strategy_{uuid.uuid4().hex}"
     spec = importlib.util.spec_from_file_location(module_name, path)
